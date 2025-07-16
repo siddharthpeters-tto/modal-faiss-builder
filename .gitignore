@@ -1,0 +1,5 @@
+.env
+__pycache__/
+.modal/
+*.pyc
+.DS_Store
