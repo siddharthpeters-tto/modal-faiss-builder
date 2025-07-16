@@ -1,7 +1,9 @@
-from modal import App, Image, Volume, Secret
+from modal import App, Image, Secret
+import modal # Import modal itself to access modal.Volume
 
 # Persisted volume to store FAISS indexes
-volume = Volume.persisted("faiss-index-storage")
+# Updated: Use modal.Volume.from_name instead of Volume.persisted
+volume = modal.Volume.from_name("faiss-index-storage", create_if_missing=True)
 
 # Modal container image
 image = (
@@ -131,7 +133,7 @@ def build_all_indexes():
 
     print("✅ All indexes and progress saved to /data")
 
-# ✅ This line is crucial for Modal to trigger the job on deploy
+# This line is crucial for Modal to trigger the job on deploy
 if __name__ == "__main__":
     with app.run():
         build_all_indexes.remote()
