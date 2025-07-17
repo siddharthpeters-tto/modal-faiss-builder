@@ -153,9 +153,10 @@ def build_index_supabase(batch_size: int = 500):
                                 "x-upsert": "true"
                             }
                         )
+                print(f"✅ {name} index and ID map uploaded.")
             except Exception as e:
                 print(f"❌ Upload failed for {name}: {e}")
-                raise  # Don't continue silently
+                raise
 
         save_and_upload("color", color_vecs)
         save_and_upload("structure", structure_vecs)
