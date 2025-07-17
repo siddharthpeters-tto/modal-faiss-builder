@@ -51,11 +51,11 @@ def build_index_supabase(batch_size: int = 500):
     all_images = resp.data
 
     #### Change above this if it does not work!
-    batch = resp.data
-    if not batch:
-        break
-    all_images.extend(batch)
-    page += 1
+    #batch = resp.data
+    #if not batch:
+    #    break
+    #all_images.extend(batch)
+    #page += 1
 
     print(f"✅ Retrieved {len(all_images)} images")
 
