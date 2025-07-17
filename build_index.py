@@ -167,6 +167,11 @@ def build_index_supabase(batch_size: int = 500):
             except Exception as e:
                 print(f"❌ Upload failed for {name}: {e}")
                 raise
+        # 💾 Save local .npy files for debugging
+        np.save("clip_color_embeddings.npy", np.stack(color_vecs))
+        np.save("clip_structure_embeddings.npy", np.stack(structure_vecs))
+        np.save("clip_combined_embeddings.npy", np.stack(combined_vecs))
+
 
         save_and_upload("color", color_vecs)
         save_and_upload("structure", structure_vecs)
