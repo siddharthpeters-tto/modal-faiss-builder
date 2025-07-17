@@ -39,13 +39,23 @@ def build_index_supabase(batch_size: int = 500):
     print("📦 Fetching product images from Supabase...")
     all_images = []
     page = 0
-    while True:
-        resp = supabase.table("product_images").select("id, image_url").range(page * 1000, (page + 1) * 1000 - 1).execute()
-        batch = resp.data
-        if not batch:
-            break
-        all_images.extend(batch)
-        page += 1
+    #while True:
+    #    resp = supabase.table("product_images").select("id, image_url").range(page * 1000, (page + 1) * 1000 - 1).execute()
+    #### Remove below this if it does not work!
+    resp = supabase.table("product_images") \
+        .select("id, image_url") \
+        .or_("image_url.ilike.%ikon%,image_url.ilike.%volt%") \
+        .limit(400) \
+        .execute()
+
+    all_images = resp.data
+
+    #### Change above this if it does not work!
+    batch = resp.data
+    if not batch:
+        break
+    all_images.extend(batch)
+    page += 1
 
     print(f"✅ Retrieved {len(all_images)} images")
 
