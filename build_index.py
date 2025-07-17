@@ -1,17 +1,27 @@
-from modal import App, Image, Secret
-import modal # Import modal itself to access modal.Volume
+from modal import App, Image, Secret, Volume
+import os, json
+import numpy as np
+import faiss
+import torch
+import clip
+import requests
+from io import BytesIO
+from tqdm import tqdm
+from PIL import Image as PILImage, UnidentifiedImageError
+from supabase import create_client
+from dotenv import load_dotenv
+import boto3
+from botocore.client import Config
 
-# Persisted volume to store FAISS indexes
-# Updated: Use modal.Volume.from_name instead of Volume.persisted
-volume = modal.Volume.from_name("faiss-index-storage", create_if_missing=True)
+# Modal setup
+volume = Volume.from_name("faiss-index-storage", create_if_missing=True)
 
-# Modal container image
 image = (
     Image.debian_slim()
     .apt_install("git")
     .pip_install(
         "faiss-cpu", "torch", "numpy", "ftfy", "regex", "tqdm", "requests",
-        "Pillow", "supabase", "python-dotenv"
+        "Pillow", "supabase", "python-dotenv", "boto3"
     )
     .pip_install("git+https://github.com/openai/CLIP.git")
 )
@@ -25,19 +35,24 @@ app = App("build-faiss-all", image=image, secrets=[Secret.from_name("supabase-cr
     secrets=[Secret.from_name("supabase-creds")]
 )
 def build_all_indexes():
-    import os, json
-    import numpy as np
-    import faiss
-    import torch
-    import clip
-    import requests
-    from io import BytesIO
-    from tqdm import tqdm
-    from PIL import Image, UnidentifiedImageError
-    from supabase import create_client
-    from dotenv import load_dotenv
-
     load_dotenv()
+
+    # R2 setup
+    R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+    R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+    R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+    R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+    R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL")
+
+    r2 = boto3.client(
+        's3',
+        endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version='s3v4'),
+        region_name='auto',
+    )
+
     supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("ViT-B/32", device=device)
@@ -57,13 +72,11 @@ def build_all_indexes():
     print(f"✅ Retrieved {len(all_images)} images")
     valid_images = [img for img in all_images if img["image_url"].lower().endswith((".jpg", ".jpeg", ".png"))]
 
-    # Checkpoint logic
     progress_path = "/data/progress.json"
+    seen_ids = set()
     if os.path.exists(progress_path):
         with open(progress_path, "r") as f:
             seen_ids = set(json.load(f))
-    else:
-        seen_ids = set()
 
     color_vecs, structure_vecs, combined_vecs = [], [], []
     id_map = []
@@ -77,7 +90,7 @@ def build_all_indexes():
             if not r.headers.get("Content-Type", "").startswith("image/"):
                 continue
 
-            pil_color = Image.open(BytesIO(r.content)).convert("RGB")
+            pil_color = PILImage.open(BytesIO(r.content)).convert("RGB")
             pil_grey = pil_color.convert("L").convert("RGB")
 
             color_tensor = preprocess(pil_color).unsqueeze(0).to(device)
@@ -107,33 +120,37 @@ def build_all_indexes():
             print(f"❌ Failed on {img['image_url']}: {e}")
             continue
 
-    def save_index(vectors, index_path, map_path):
+    def save_and_upload(name, vectors):
+        if not vectors:
+            print(f"⚠️ Skipping {name} — no vectors.")
+            return
+
         arr = np.stack(vectors).astype(np.float32)
         faiss.normalize_L2(arr)
         idx = faiss.IndexFlatIP(arr.shape[1])
         idx.add(arr)
+
+        index_path = f"/data/clip_{name}.index"
+        idmap_path = f"/data/id_map_{name}.json"
+
         faiss.write_index(idx, index_path)
-        with open(map_path, "w") as f:
+        with open(idmap_path, "w") as f:
             json.dump(id_map, f)
 
-    def conditional_save(name, vectors, index_path, map_path):
-        if vectors:
-            print(f"💾 Saving {name} index with {len(vectors)} vectors...")
-            save_index(vectors, index_path, map_path)
-        else:
-            print(f"⚠️ Skipping {name} index — no new vectors.")
+        print(f"⬆️ Uploading {name} index to R2...")
+        r2.upload_file(index_path, R2_BUCKET_NAME, f"faiss/clip_{name}.index")
+        r2.upload_file(idmap_path, R2_BUCKET_NAME, f"faiss/id_map_{name}.json")
+        print(f"✅ {name} index uploaded.")
 
-    print("💾 Saving all FAISS indexes...")
-    conditional_save("color", color_vecs, "/data/clip_color.index", "/data/id_map_color.json")
-    conditional_save("structure", structure_vecs, "/data/clip_structure.index", "/data/id_map_structure.json")
-    conditional_save("combined", combined_vecs, "/data/clip_combined.index", "/data/id_map_combined.json")
+    save_and_upload("color", color_vecs)
+    save_and_upload("structure", structure_vecs)
+    save_and_upload("combined", combined_vecs)
 
     with open(progress_path, "w") as f:
         json.dump(list(seen_ids), f)
 
-    print("✅ All indexes and progress saved to /data")
+    print("🎉 All indexes built and uploaded successfully.")
 
-# This line is crucial for Modal to trigger the job on deploy
 if __name__ == "__main__":
     with app.run():
         build_all_indexes.remote()
