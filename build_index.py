@@ -172,6 +172,25 @@ def build_index_supabase(batch_size: int = 500):
         np.save("clip_structure_embeddings.npy", np.stack(structure_vecs))
         np.save("clip_combined_embeddings.npy", np.stack(combined_vecs))
 
+ # ⬆️ Upload .npy files to Supabase Storage
+        def upload_npy_to_supabase(filename):
+            try:
+                with open(filename, "rb") as f:
+                    supabase.storage.from_("faiss").upload(
+                        file=f,
+                        path=filename,
+                        file_options={
+                            "content-type": "application/octet-stream",
+                            "x-upsert": "true"
+                        }
+                    )
+                print(f"✅ Uploaded {filename} to Supabase.")
+            except Exception as e:
+                print(f"❌ Failed to upload {filename}: {e}")
+
+        upload_npy_to_supabase("clip_color_embeddings.npy")
+        upload_npy_to_supabase("clip_structure_embeddings.npy")
+        upload_npy_to_supabase("clip_combined_embeddings.npy")
 
         save_and_upload("color", color_vecs)
         save_and_upload("structure", structure_vecs)
