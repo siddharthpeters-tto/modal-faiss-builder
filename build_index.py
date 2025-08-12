@@ -34,7 +34,7 @@ image = (
     .pip_install("git+https://github.com/openai/CLIP.git")
 )
 
-app = App(name="build-multi-index-faiss", image=image, secrets=[Secret.from_name("supabase-creds")])])
+app = App(name="build-multi-index-faiss", image=image, secrets=[Secret.from_name("supabase-creds")])
 
 # ---------------------------
 # Config
