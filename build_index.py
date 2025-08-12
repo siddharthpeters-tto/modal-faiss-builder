@@ -211,8 +211,14 @@ def build_index_supabase():
     new_ids_by_type = {t: [] for t in INDEX_TYPES}
     brands_added = defaultdict(int)  # For end-of-run report
 
-    for start in tqdm(range(0, len(rows), BATCH_SIZE), desc="Embedding Batches"):
-        batch = rows[start:start + BATCH_SIZE]
+    for start in tqdm(range(0, len(all_image_ids), BATCH_SIZE), desc="Embedding Batches"):
+        batch_ids = all_image_ids[start:start + BATCH_SIZE]
+        # Fetch actual image data for this batch
+        resp = supabase.table("product_images") \
+            .select("id,image_url") \
+            .in_("id", batch_ids) \
+            .execute()
+        batch = resp.data
         skipped_count = 0
         embedded_count = 0
         per_type_added = {t: 0 for t in INDEX_TYPES}
