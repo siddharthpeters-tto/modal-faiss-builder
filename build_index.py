@@ -5,7 +5,7 @@ from collections import defaultdict
 from urllib.parse import urlparse
 from io import BytesIO
 
-import modal
+from modal import App, Image, Secret
 import requests
 import faiss
 import numpy as np
@@ -17,7 +17,7 @@ from supabase import create_client
 # Modal image with dependencies (no new deps added)
 # ---------------------------
 image = (
-    modal.Image.debian_slim()
+    Image.debian_slim()
     .apt_install("git")
     .pip_install(
         "faiss-cpu",
@@ -34,7 +34,7 @@ image = (
     .pip_install("git+https://github.com/openai/CLIP.git")
 )
 
-stub = modal.Stub("faiss-index-builder", image=image)
+app = App(name="build-multi-index-faiss", image=image, secrets=[Secret.from_name("supabase-creds")])])
 
 # ---------------------------
 # Config
@@ -48,19 +48,20 @@ PROGRESS_FILE = os.path.join(LOCAL_FAISS_DIR, "progress.json")
 # ---------------------------
 # Main function
 # ---------------------------
-@stub.function(
+@app.function(
     image=image,
     timeout=3600,
-    gpu="A10G",
-    mounts=[modal.Mount.from_local_dir(".", remote_path="/root/app")]
+    gpu="A10G"
 )
 def build_index_supabase():
     import torch
     import clip  # loaded from git install above
 
     # Supabase config
-    SUPABASE_URL = os.environ["SUPABASE_URL"]
-    SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+    from dotenv import load_dotenv
+    load_dotenv()
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
     # Device & model
@@ -173,10 +174,36 @@ def build_index_supabase():
 
     # ---------------------------
     # Get all images from DB
-    # ---------------------------
-    # NOTE: if your table is large, consider paginated fetch as in your earlier code.
-    rows = supabase.table("product_images").select("id,image_url").execute().data
-    print(f"📊 Total images in DB: {len(rows)}")
+
+    # --- Get all image IDs and total count ---
+    print("Fetching all image IDs from Supabase to establish processing order...")
+    all_image_ids = []
+    current_offset = 0
+    id_fetch_limit = 1000  # Supabase default limit for select queries
+
+    try:
+        while True:
+            # Fetch IDs in batches
+            ids_resp = supabase.table("product_images") \
+                .select("id") \
+                .order("id") \
+                .range(current_offset, current_offset + id_fetch_limit - 1) \
+                .execute()
+
+            if not ids_resp.data:
+                break  # No more IDs to fetch
+
+            all_image_ids.extend([item['id'] for item in ids_resp.data])
+            current_offset += id_fetch_limit
+            print(f"Fetched {len(all_image_ids)} IDs so far...")
+
+        total_images = len(all_image_ids)
+        print(f"There are a total of {total_images} images in your Supabase table.")
+    except Exception as e:
+        print(f"Could not retrieve all image IDs or total count: {e}. Cannot proceed without a definitive list of IDs.")
+        return  # Exit if we can't get the full list of IDs
+
+    total_processed_count = 0
 
     # ---------------------------
     # Main embedding loop
