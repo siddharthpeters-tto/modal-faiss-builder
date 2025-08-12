@@ -33,6 +33,7 @@ def build_index_supabase():
     supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("ViT-B/32", device=device)
+    print(f"✅ Using device: {device}")
 
     print("📦 Fetching product images from Supabase...")
     resp = supabase.table("product_images") \

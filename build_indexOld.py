@@ -10,7 +10,7 @@ from PIL import Image as PILImage, UnidentifiedImageError
 from tqdm import tqdm
 from dotenv import load_dotenv
 from supabase import create_client
-import math  # Import math for ceil function
+import math # Import math for ceil function
 
 image = (
     Image.debian_slim()
@@ -47,7 +47,7 @@ def build_index_supabase():
         resp = supabase.storage.from_("faiss").download(PROGRESS_FILE_NAME)
         progress_data = json.loads(resp.decode('utf-8'))
         for index_type in INDEX_TYPES:
-            last_processed_ids[index_type] = progress_data.get(index_type, None)  # Store UUID string or None
+            last_processed_ids[index_type] = progress_data.get(index_type, None) # Store UUID string or None
             if last_processed_ids[index_type]:
                 print(f"Resuming {index_type} index from image ID: {last_processed_ids[index_type]}")
             else:
@@ -55,27 +55,13 @@ def build_index_supabase():
     except Exception as e:
         print(f"No existing {PROGRESS_FILE_NAME} found or error loading: {e}. Starting all indexes from the beginning.")
         for index_type in INDEX_TYPES:
-            last_processed_ids[index_type] = None  # Start from the beginning if file not found or error
-
-    # --- Load existing indexed IDs once, to skip re-embedding ---
-    # We load per-index ID maps (not just a union) so we only skip an image if
-    # it already exists in *all* three indexes. If one is missing it, we'll embed
-    # once and the save step will add it only to the missing index.
-    indexed_ids_by_type = {}
-    for name in INDEX_TYPES:
-        try:
-            data = supabase.storage.from_("faiss").download(f"id_map_{name}.json")
-            indexed_ids_by_type[name] = set(json.loads(data.decode("utf-8")))
-            print(f"🔎 Loaded {len(indexed_ids_by_type[name])} existing IDs for '{name}' index.")
-        except Exception as e:
-            tqdm.write(f"No existing id_map for {name} or error loading: {e}. Treating as empty.")
-            indexed_ids_by_type[name] = set()
+            last_processed_ids[index_type] = None # Start from the beginning if file not found or error
 
     # --- Get all image IDs and total count ---
     print("Fetching all image IDs from Supabase to establish processing order...")
     all_image_ids = []
     current_offset = 0
-    id_fetch_limit = 1000  # Supabase default limit for select queries
+    id_fetch_limit = 1000 # Supabase default limit for select queries
 
     try:
         while True:
@@ -87,7 +73,7 @@ def build_index_supabase():
                 .execute()
 
             if not ids_resp.data:
-                break  # No more IDs to fetch
+                break # No more IDs to fetch
 
             all_image_ids.extend([item['id'] for item in ids_resp.data])
             current_offset += id_fetch_limit
@@ -97,25 +83,40 @@ def build_index_supabase():
         print(f"There are a total of {total_images} images in your Supabase table.")
     except Exception as e:
         print(f"Could not retrieve all image IDs or total count: {e}. Cannot proceed without a definitive list of IDs.")
-        return  # Exit if we can't get the full list of IDs
+        return # Exit if we can't get the full list of IDs
+
+    # Calculate total number of batches
+    #total_batches = math.ceil(total_images / BATCH_SIZE) if total_images > 0 else 0
 
     # --- Determine starting point for processing ---
-    # Force a full scan from the beginning to avoid missing newly inserted UUIDs
-    # that might sort *before* the saved checkpoints. We'll skip quickly using
-    # the id_map sets above, so we don't re-embed existing images.
     start_index = 0
+    if last_processed_ids and all(lp_id is not None for lp_id in last_processed_ids.values()):
+        # If all index types have a last processed ID, find the earliest one to resume from
+        # This ensures we don't skip images if one index type is behind
+        earliest_resume_id = min(filter(None, last_processed_ids.values())) # Use filter(None, ...) to ignore None values
+        try:
+            # Find the index of the earliest resume ID in the sorted list of all IDs
+            start_index = all_image_ids.index(earliest_resume_id)
+            print(f"Resuming processing from image ID {earliest_resume_id} (index {start_index} in total list).")
+        except ValueError:
+            print(f"Warning: Earliest resume ID {earliest_resume_id} not found in current list of all IDs. Starting from beginning.")
+            start_index = 0 # Fallback if the ID is somehow missing
 
     total_processed_count = 0
+
     resumed_total_batches = math.ceil((total_images - start_index) / BATCH_SIZE) if total_images > 0 else 0
 
-    # --- Main Loop for Pagination using ID chunks ---
-    for batch_num, i in enumerate(tqdm(range(start_index, total_images, BATCH_SIZE), desc="Processing Batches"), start=1):
-        current_id_chunk = all_image_ids[i: i + BATCH_SIZE]
-        if not current_id_chunk:
-            break  # No more IDs to process
 
+    # --- Main Loop for Pagination using ID chunks ---
+    # Use enumerate to get the current batch number
+    for batch_num, i in enumerate(tqdm(range(start_index, total_images, BATCH_SIZE), desc="Processing Batches"), start=1):
+        current_id_chunk = all_image_ids[i : i + BATCH_SIZE]
+        if not current_id_chunk:
+            break # No more IDs to process
+
+        # Update the tqdm description to show batch progress
+        tqdm.write(f"📦 Processing batch {batch_num}/{resumed_total_batches} (IDs: {current_id_chunk[0]} to {current_id_chunk[-1]})...")
         # Fetch images using 'in' clause for the current chunk of IDs
-        tqdm.write(f"📦 Processing batch {batch_num}/{resumed_total_batches} (IDs: {current_id_chunk[0]} to {current_id_chunk[-1]})…")
         resp = supabase.table("product_images") \
             .select("id, image_url") \
             .in_("id", current_id_chunk) \
@@ -129,26 +130,54 @@ def build_index_supabase():
         tqdm.write(f"✅ Retrieved {len(batch_images)} images in this batch.")
 
         def is_valid_image(img):
+            # Keep this check to ensure only valid image formats are processed
             return img["image_url"].lower().endswith((".jpg", ".jpeg", ".png"))
 
-        # Build the list of images we actually need to embed (skip those present in all indexes)
         current_batch_for_processing = []
+        # Filter out images already processed based on last_processed_ids for each index type
+        # And ensure they are valid image formats
         for img in batch_images:
-            if not is_valid_image(img):
-                continue
-            # Skip if this ID already exists in *all* index maps
-            already_in_all = all(img["id"] in indexed_ids_by_type[t] for t in INDEX_TYPES)
-            if already_in_all:
-                continue
-            current_batch_for_processing.append(img)
+            process_this_image = False
+            # An image needs to be processed if its ID is 'after' the last processed ID for *any* index type
+            # We determine "after" by checking its position in the `all_image_ids` list
+            # It's crucial that img["id"] exists in all_image_ids for this to work.
+            try:
+                img_global_index = all_image_ids.index(img["id"]) # Get its position in the master list
+            except ValueError:
+                tqdm.write(f"Warning: Image ID {img['id']} found in batch but not in master list. Skipping.")
+                continue # Skip this image if it's not in our master ordered list
 
-        tqdm.write(f"🆕 {len(current_batch_for_processing)} new valid images to embed in this batch.")
+            for index_type in INDEX_TYPES:
+                last_id_for_type = last_processed_ids.get(index_type)
+                if last_id_for_type is None: # If no progress for this type, process it
+                    process_this_image = True
+                    break
+                else:
+                    # Find the global index of the last processed ID for this type
+                    try:
+                        last_id_global_index = all_image_ids.index(last_id_for_type)
+                        if img_global_index > last_id_global_index:
+                            process_this_image = True
+                            break
+                    except ValueError:
+                        # If last_id_for_type is not found (e.g., deleted from DB), re-process from current image
+                        process_this_image = True
+                        break
+
+            if process_this_image and is_valid_image(img):
+                current_batch_for_processing.append(img)
+            else:
+                pass # Explicitly pass for the else block to avoid indentation error
+
+        # This print statement was incorrectly indented. It should be outside the inner for loop.
+        tqdm.write(f"� {len(current_batch_for_processing)} new valid images to embed in this batch.")
+
         if not current_batch_for_processing:
-            continue  # Move to the next batch
+            continue # Move to the next batch if all images in this one were already processed or invalid
 
         color_vecs, structure_vecs, combined_vecs = [], [], []
-        id_map_for_batch = []  # Local map for this batch
-        last_id_in_current_batch = None  # Track the last processed ID (UUID) in the current batch
+        id_map_for_batch = [] # Renamed to avoid confusion with global id_map
+        last_id_in_current_batch = None # To track the last processed ID (UUID) in the current batch
 
         for img in tqdm(current_batch_for_processing, desc=f"Embedding Batch {batch_num}/{resumed_total_batches}"):
             try:
@@ -180,6 +209,7 @@ def build_index_supabase():
                     "id": img["id"],
                     "image_url": img["image_url"]
                 })
+                # Update last_id_in_current_batch with the UUID of the last successfully processed image
                 last_id_in_current_batch = img["id"]
 
             except (UnidentifiedImageError, Exception) as e:
@@ -204,17 +234,18 @@ def build_index_supabase():
             vectors_to_add = []
             ids_to_add_to_map = []
             for i, entry in enumerate(id_entries_from_current_batch):
-                entry_id_uuid = entry["id"]  # UUID string
+                entry_id_uuid = entry["id"] # ID is already a UUID string
                 if entry_id_uuid not in existing_ids_set:
                     vectors_to_add.append(vectors_from_current_batch[i])
-                    ids_to_add_to_map.append(entry_id_uuid)
+                    ids_to_add_to_map.append(entry_id_uuid) # Store as UUID string in the map
                 else:
-                    pass
+                    pass # tqdm.write(f"Skipping ID {entry_id_uuid} for {name} index: already in existing map.") # Uncomment for detailed debug
+
 
             if not vectors_to_add:
                 tqdm.write(f"⚠️ No NEW vectors to save for {name} in this batch. Skipping FAISS update for this index.")
                 # Still update progress if this index type is caught up
-                if last_processed_uuid_for_batch:  # Only update if there was at least one image in this batch
+                if last_processed_uuid_for_batch: # Only update if there was at least one image in this batch
                     last_processed_ids[name] = last_processed_uuid_for_batch
                     with open(PROGRESS_FILE_NAME, "w") as f:
                         json.dump(last_processed_ids, f)
@@ -241,7 +272,7 @@ def build_index_supabase():
                 tqdm.write(f"No existing {name} index found or error loading: {e}. Creating new index.")
                 index = faiss.IndexFlatIP(np_vectors_to_add.shape[1])
 
-            index.add(np_vectors_to_add)  # Add only the truly new vectors
+            index.add(np_vectors_to_add) # Add only the truly new vectors
             faiss.write_index(index, index_path)
 
             # Extend the existing ID map with only the truly new IDs
@@ -265,7 +296,7 @@ def build_index_supabase():
 
             # Update progress.json in Supabase Storage
             with open(PROGRESS_FILE_NAME, "w") as f:
-                json.dump(last_processed_ids, f)  # Save the current state of all indexes
+                json.dump(last_processed_ids, f) # Save the current state of all indexes
 
             with open(PROGRESS_FILE_NAME, "rb") as f:
                 supabase.storage.from_("faiss").upload(
@@ -276,6 +307,7 @@ def build_index_supabase():
 
             tqdm.write(f"✅ Uploaded {name} index and updated progress with {len(vectors_to_add)} NEW vectors. Last processed ID for {name}: {last_processed_uuid_for_batch}")
 
+
         # Process and save for each index type
         if color_vecs:
             save_index_and_update_progress("color", color_vecs, id_map_for_batch, last_id_in_current_batch)
@@ -285,5 +317,8 @@ def build_index_supabase():
             save_index_and_update_progress("combined", combined_vecs, id_map_for_batch, last_id_in_current_batch)
 
         total_processed_count += len(current_batch_for_processing)
+        # The loop automatically advances to the next batch based on `range(start_index, total_images, BATCH_SIZE)`
+        # No need to manually increment offset here.
 
     print(f"🎉 All FAISS indexes built cleanly and uploaded. Total images processed: {total_processed_count}")
+
