@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 from io import BytesIO
 
 from modal import App, Image, Secret
-from modal.mount import Mount
 
 import requests
 import faiss
@@ -58,11 +57,12 @@ PROGRESS_FILE = os.path.join(LOCAL_FAISS_DIR, "progress.json")
 # ---------------------------
 # Main function
 # ---------------------------
+image = image.add_local_file("faiss_sharding.py", remote_path="/root/faiss_sharding.py")
+
 @app.function(
     image=image,
     timeout=3600,
     gpu="A10G",
-    mounts=[Mount.from_local_file("faiss_sharding.py", remote_path="/root/faiss_sharding.py")]
 )
 def build_index_supabase():
     import torch
