@@ -98,14 +98,16 @@ def save_manifest(supabase, manifest: Dict) -> None:
 # -----------------------------
 
 def _upload_shard(supabase, embed_type: str, shard_id: int, ix: faiss.Index) -> float:
-    data = faiss.serialize_index(ix)
+    # Serialize FAISS index to bytes
+    data_bytes = faiss.serialize_index(ix)
     path = _shard_key(embed_type, shard_id)
     supabase.storage.from_(BUCKET).upload(
         path=path,
-        file=data,
-        file_options={"contentType": "application/octet-stream", "upsert": True},
+        file=bytes(data_bytes),
+        file_options={"contentType": "application/octet-stream", "upsert": "true"},
     )
-    return len(data) / (1024 * 1024)
+    return len(data_bytes) / (1024 * 1024)
+
 
 
 def _append_manifest_entry(supabase, embed_type: str, shard_id: int, ix: faiss.Index, approx_mb: float) -> None:

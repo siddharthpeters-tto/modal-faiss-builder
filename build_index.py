@@ -112,7 +112,7 @@ def build_index_supabase():
         supabase.storage.from_(bucket).upload(
             path=path,
             file=json.dumps(data).encode("utf-8"),
-            file_options={"contentType": "application/json", "upsert": True},
+            file_options={"contentType": "application/json", "upsert": "true"},
         )
 
 
@@ -131,14 +131,12 @@ def build_index_supabase():
         return None
 
     def upload_faiss_index(bucket, path, index):
-        tmp = tempfile.NamedTemporaryFile(delete=False)
-        faiss.write_index(index, tmp.name); tmp.close()
-        with open(tmp.name, "rb") as f:
-            supabase.storage.from_(bucket).upload(
-                path=path,
-                file=f.read(),
-                file_options={"contentType": "application/octet-stream", "upsert": True},
-            )
+        data_bytes = faiss.serialize_index(index)
+        supabase.storage.from_(bucket).upload(
+            path=path,
+            file=bytes(data_bytes),
+            file_options={"contentType": "application/octet-stream", "upsert": "true"},
+        )
 
     def is_valid_image_url(url: str):
         return url.lower().endswith(VALID_EXTENSIONS)
