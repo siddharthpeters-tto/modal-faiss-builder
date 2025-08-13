@@ -48,7 +48,7 @@ app = App(name="build-multi-index-faiss", image=image, secrets=[Secret.from_name
 # ---------------------------
 # Config
 # ---------------------------
-BATCH_SIZE = 1000  # increased for fewer round-trips; checkpointed each batch
+BATCH_SIZE = 500  # increased for fewer round-trips; checkpointed each batch
 INDEX_TYPES = ["color", "structure", "combined"]
 LOCAL_FAISS_DIR = "/tmp/faiss"  # Persistent for the life of the container
 VALID_EXTENSIONS = (".jpg", ".jpeg", ".png")
