@@ -14,6 +14,13 @@ from tqdm import tqdm
 from PIL import Image as PILImage, UnidentifiedImageError
 from supabase import create_client
 
+# NEW: sharding helpers
+from faiss_sharding import (
+    ShardState,
+    maybe_rotate_and_upload_shard,
+    flush_open_shard,
+)
+
 # ---------------------------
 # Modal image with dependencies (no new deps added)
 # ---------------------------
@@ -40,7 +47,7 @@ app = App(name="build-multi-index-faiss", image=image, secrets=[Secret.from_name
 # ---------------------------
 # Config
 # ---------------------------
-BATCH_SIZE = 500  # increased for fewer round-trips; checkpointed each batch
+BATCH_SIZE = 1000  # increased for fewer round-trips; checkpointed each batch
 INDEX_TYPES = ["color", "structure", "combined"]
 LOCAL_FAISS_DIR = "/tmp/faiss"  # Persistent for the life of the container
 VALID_EXTENSIONS = (".jpg", ".jpeg", ".png")
@@ -68,6 +75,7 @@ def build_index_supabase():
     # Device & model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("ViT-B/32", device=device)
+    model.eval()
     print(f"✅ Using device: {device}")
 
     # Ensure local dir
@@ -77,7 +85,7 @@ def build_index_supabase():
     # Helpers
     # ---------------------------
     def with_retries(fn, *args, **kwargs):
-        retries = kwargs.pop("retries", 3)
+        retries = kwargs.pop("retries", 5)
         delay = kwargs.pop("delay", 2.0)
         last_err = None
         for i in range(retries):
@@ -99,10 +107,11 @@ def build_index_supabase():
 
     def upload_json(bucket, path, data):
         supabase.storage.from_(bucket).upload(
-            path,
-            json.dumps(data).encode("utf-8"),
-            {"x-upsert": "true", "content-type": "application/json"}
+            path=path,
+            file=json.dumps(data).encode("utf-8"),
+            file_options={"contentType": "application/json", "upsert": True},
         )
+
 
     def download_faiss_index(bucket, path):
         try:
@@ -119,12 +128,13 @@ def build_index_supabase():
         return None
 
     def upload_faiss_index(bucket, path, index):
-        tmp_file = tempfile.NamedTemporaryFile(delete=False)
-        faiss.write_index(index, tmp_file.name)
-        tmp_file.close()
-        with open(tmp_file.name, "rb") as f:
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        faiss.write_index(index, tmp.name); tmp.close()
+        with open(tmp.name, "rb") as f:
             supabase.storage.from_(bucket).upload(
-                path, f.read(), {"x-upsert": "true", "content-type": "application/octet-stream"}
+                path=path,
+                file=f.read(),
+                file_options={"contentType": "application/octet-stream", "upsert": True},
             )
 
     def is_valid_image_url(url: str):
@@ -132,7 +142,7 @@ def build_index_supabase():
 
     def fetch_image(url):
         try:
-            r = requests.get(url, timeout=10)
+            r = requests.get(url, timeout=20)
             r.raise_for_status()
             if not r.headers.get("Content-Type", "").startswith("image/"):
                 return None
@@ -171,6 +181,9 @@ def build_index_supabase():
     indexed_ids_by_type = {}
     faiss_indexes = {}
 
+    # Embedding dim for ViT-B/32 image features is 512 across all three variants
+    DIM_BY_TYPE = {"color": 512, "structure": 512, "combined": 512}
+
     for t in INDEX_TYPES:
         local_map_path = os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json")
         remote_map = download_json("faiss", f"id_map_{t}.json") or []
@@ -188,10 +201,14 @@ def build_index_supabase():
             local_index = faiss.read_index(local_index_path)
             if remote_index:
                 remote_index.merge_from(local_index)
-            faiss_indexes[t] = remote_index
+            # If still None, create a fresh IP index
+            faiss_indexes[t] = remote_index or faiss.IndexFlatIP(DIM_BY_TYPE[t])
         else:
             # Dimension is 512 for ViT-B/32 image embeddings
-            faiss_indexes[t] = remote_index or faiss.IndexFlatIP(512)
+            faiss_indexes[t] = remote_index or faiss.IndexFlatIP(DIM_BY_TYPE[t])
+
+    # NEW: initialize sharding state (separate from monolithic in-RAM indexes)
+    shard_state = ShardState(DIM_BY_TYPE)
 
     # ---------------------------
     # Get all images from DB
@@ -225,7 +242,6 @@ def build_index_supabase():
         return  # Exit if we can't get the full list of IDs
 
     total_processed_count = 0
-
     # ---------------------------
     # Batch checkpoint helper (commit to Supabase after each batch)
     # ---------------------------
@@ -239,19 +255,19 @@ def build_index_supabase():
                 id_map_by_type[t].extend(new_ids_by_type[t])
                 with open(os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json"), "w") as f:
                     json.dump(id_map_by_type[t], f)
+                # Keep writing monolithic local file (resume safety), but DO NOT upload it to Supabase
                 faiss.write_index(faiss_indexes[t], os.path.join(LOCAL_FAISS_DIR, f"clip_{t}.index"))
                 new_ids_by_type[t] = []
 
-        # 2) Upload to Supabase with retries (atomic per-file)
+        # 2) Upload to Supabase with retries (JSONs only; shards are uploaded continuously by shard rotation)
         with_retries(upload_json, "faiss", "progress.json", progress)
         for t in INDEX_TYPES:
             local_map_path = os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json")
-            local_index_path = os.path.join(LOCAL_FAISS_DIR, f"clip_{t}.index")
-            if os.path.exists(local_map_path) and os.path.exists(local_index_path):
+            if os.path.exists(local_map_path):
                 with open(local_map_path, "r") as f:
                     current_map = json.load(f)
                 with_retries(upload_json, "faiss", f"id_map_{t}.json", current_map)
-                with_retries(upload_faiss_index, "faiss", f"clip_{t}.index", faiss_indexes[t])
+        # NOTE: intentionally NOT uploading clip_{t}.index to avoid 413
 
     # ---------------------------
     # Main embedding loop
@@ -321,6 +337,16 @@ def build_index_supabase():
                 else:  # combined
                     faiss_indexes[t].add(combined_vec)
 
+                # NEW: also add to the current open shard and rotate/upload if needed
+                shard_state.ensure_open(t)
+                if t == "color":
+                    shard_state.current_ix[t].add(color_vec)
+                elif t == "structure":
+                    shard_state.current_ix[t].add(grey_vec)
+                else:
+                    shard_state.current_ix[t].add(combined_vec)
+                maybe_rotate_and_upload_shard(supabase, t, shard_state)
+
                 indexed_ids_by_type[t].add(img_id)
                 new_ids_by_type[t].append(img_id)
                 per_type_added[t] += 1
@@ -336,16 +362,19 @@ def build_index_supabase():
             + ", ".join(f"{t}:{per_type_added[t]}" for t in INDEX_TYPES)
         )
 
-        # ✅ Robust checkpoint: save + upload after each batch
+        for t in INDEX_TYPES:
+            flush_open_shard(supabase, t, shard_state)
+
+        # ✅ Robust checkpoint: save + upload after each batch (JSON and shards only)
         checkpoint_batch(id_map_by_type, new_ids_by_type, faiss_indexes, progress)
 
     # ---------------------------
-    # Final upload (kept as safety; most work already committed per batch)
+    # Finalize: flush any open shard(s) and push final JSONs
     # ---------------------------
-    print("☁️ Finalizing (safety upload) to Supabase...")
+    print("☁️ Flushing any open shards and finalizing JSONs to Supabase...")
     for t in INDEX_TYPES:
+        flush_open_shard(supabase, t, shard_state)
         with_retries(upload_json, "faiss", f"id_map_{t}.json", id_map_by_type[t])
-        with_retries(upload_faiss_index, "faiss", f"clip_{t}.index", faiss_indexes[t])
     with_retries(upload_json, "faiss", "progress.json", progress)
 
     # ---------------------------
@@ -355,4 +384,4 @@ def build_index_supabase():
     for brand, count in sorted(brands_added.items(), key=lambda x: x[1], reverse=True):
         print(f"{brand}: {count} new vectors")
 
-    print("\n🎉 All FAISS indexes built with per-batch remote checkpoints and full resume capability.")
+    print("\n🎉 All FAISS indexes built with per-batch remote checkpoints, sharded uploads, and full resume capability.")

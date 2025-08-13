@@ -3,3 +3,5 @@ __pycache__/
 .modal/
 *.pyc
 .DS_Store
+build_index_Old.py
+ReviewDeleteNonImage.py
