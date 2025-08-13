@@ -89,7 +89,7 @@ def save_manifest(supabase, manifest: Dict) -> None:
     supabase.storage.from_(BUCKET).upload(
         path=path,
         file=json.dumps(manifest).encode("utf-8"),
-        file_options={"contentType": "application/json", "upsert": True},
+        file_options={"contentType": "application/json", "upsert": "true"},
     )
 
 
