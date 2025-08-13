@@ -1,75 +1,179 @@
-from modal import App, Image, Secret
-import os, json
-import numpy as np
-import faiss
-import torch
-import clip
-import requests
+import os
+import json
+import tempfile
+from collections import defaultdict
+from urllib.parse import urlparse
 from io import BytesIO
-from PIL import Image as PILImage, UnidentifiedImageError
-from tqdm import tqdm
-from dotenv import load_dotenv
-from supabase import create_client
-import math  # Import math for ceil function
 
+from modal import App, Image, Secret
+import requests
+import faiss
+import numpy as np
+from tqdm import tqdm
+from PIL import Image as PILImage, UnidentifiedImageError
+from supabase import create_client
+
+# ---------------------------
+# Modal image with dependencies (no new deps added)
+# ---------------------------
 image = (
     Image.debian_slim()
     .apt_install("git")
     .pip_install(
-        "faiss-cpu", "torch", "numpy", "ftfy", "regex", "tqdm", "requests",
-        "Pillow", "supabase", "python-dotenv"
+        "faiss-cpu",
+        "torch",
+        "numpy",
+        "ftfy",
+        "regex",
+        "tqdm",
+        "requests",
+        "Pillow",
+        "supabase",
+        "python-dotenv"
     )
     .pip_install("git+https://github.com/openai/CLIP.git")
 )
 
-app = App(
-    name="build-multi-index-faiss",
-    image=image,
-    secrets=[Secret.from_name("supabase-creds")]
-)
+app = App(name="build-multi-index-faiss", image=image, secrets=[Secret.from_name("supabase-creds")])
 
-@app.function(gpu="A10G", timeout=3600)
+# ---------------------------
+# Config
+# ---------------------------
+BATCH_SIZE = 200
+INDEX_TYPES = ["color", "structure", "combined"]
+LOCAL_FAISS_DIR = "/tmp/faiss"  # Persistent for the life of the container
+VALID_EXTENSIONS = (".jpg", ".jpeg", ".png")
+PROGRESS_FILE = os.path.join(LOCAL_FAISS_DIR, "progress.json")
+
+# ---------------------------
+# Main function
+# ---------------------------
+@app.function(
+    image=image,
+    timeout=3600,
+    gpu="A10G"
+)
 def build_index_supabase():
+    import torch
+    import clip  # loaded from git install above
+
+    # Supabase config
+    from dotenv import load_dotenv
     load_dotenv()
-    supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    # Device & model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("ViT-B/32", device=device)
     print(f"✅ Using device: {device}")
 
-    # --- Configuration for pagination and resumption ---
-    BATCH_SIZE = 200
-    INDEX_TYPES = ["color", "structure", "combined"]
-    PROGRESS_FILE_NAME = "progress.json"
+    # Ensure local dir
+    os.makedirs(LOCAL_FAISS_DIR, exist_ok=True)
 
-    # Initialize or load last processed ID (UUID string) for each index type from Supabase Storage
-    last_processed_ids = {}
-    try:
-        resp = supabase.storage.from_("faiss").download(PROGRESS_FILE_NAME)
-        progress_data = json.loads(resp.decode('utf-8'))
-        for index_type in INDEX_TYPES:
-            last_processed_ids[index_type] = progress_data.get(index_type, None)  # Store UUID string or None
-            if last_processed_ids[index_type]:
-                print(f"Resuming {index_type} index from image ID: {last_processed_ids[index_type]}")
-            else:
-                print(f"Starting {index_type} index from the beginning.")
-    except Exception as e:
-        print(f"No existing {PROGRESS_FILE_NAME} found or error loading: {e}. Starting all indexes from the beginning.")
-        for index_type in INDEX_TYPES:
-            last_processed_ids[index_type] = None  # Start from the beginning if file not found or error
-
-    # --- Load existing indexed IDs once, to skip re-embedding ---
-    # We load per-index ID maps (not just a union) so we only skip an image if
-    # it already exists in *all* three indexes. If one is missing it, we'll embed
-    # once and the save step will add it only to the missing index.
-    indexed_ids_by_type = {}
-    for name in INDEX_TYPES:
+    # ---------------------------
+    # Helpers
+    # ---------------------------
+    def download_json(bucket, path):
         try:
-            data = supabase.storage.from_("faiss").download(f"id_map_{name}.json")
-            indexed_ids_by_type[name] = set(json.loads(data.decode("utf-8")))
-            print(f"🔎 Loaded {len(indexed_ids_by_type[name])} existing IDs for '{name}' index.")
-        except Exception as e:
-            tqdm.write(f"No existing id_map for {name} or error loading: {e}. Treating as empty.")
-            indexed_ids_by_type[name] = set()
+            res = supabase.storage.from_(bucket).download(path)
+            if res:
+                return json.loads(res.decode("utf-8"))
+        except Exception:
+            pass
+        return None
+
+    def upload_json(bucket, path, data):
+        supabase.storage.from_(bucket).upload(
+            path,
+            json.dumps(data).encode("utf-8"),
+            {"x-upsert": "true", "content-type": "application/json"}
+        )
+
+    def download_faiss_index(bucket, path):
+        try:
+            res = supabase.storage.from_(bucket).download(path)
+            if res:
+                tmp_file = tempfile.NamedTemporaryFile(delete=False)
+                tmp_file.write(res)
+                tmp_file.flush()
+                index = faiss.read_index(tmp_file.name)
+                tmp_file.close()
+                return index
+        except Exception:
+            pass
+        return None
+
+    def upload_faiss_index(bucket, path, index):
+        tmp_file = tempfile.NamedTemporaryFile(delete=False)
+        faiss.write_index(index, tmp_file.name)
+        tmp_file.close()
+        with open(tmp_file.name, "rb") as f:
+            supabase.storage.from_(bucket).upload(
+                path, f.read(), {"x-upsert": "true", "content-type": "application/octet-stream"}
+            )
+
+    def is_valid_image_url(url: str):
+        return url.lower().endswith(VALID_EXTENSIONS)
+
+    def fetch_image(url):
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            if not r.headers.get("Content-Type", "").startswith("image/"):
+                return None
+            img = PILImage.open(BytesIO(r.content)).convert("RGB")
+            return img
+        except (requests.RequestException, UnidentifiedImageError, OSError):
+            return None
+
+    def extract_brand_from_url(url: str):
+        path = urlparse(url).path.strip("/")
+        if "/" in path:
+            return path.split("/")[0].lower()
+        return "unknown"
+
+    # ---------------------------
+    # Load progress.json
+    # ---------------------------
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, "r") as f:
+            progress = json.load(f)
+    else:
+        progress = {t: None for t in INDEX_TYPES}
+
+    # ---------------------------
+    # Load id_maps & indexes
+    # ---------------------------
+    id_map_by_type = {}
+    indexed_ids_by_type = {}
+    faiss_indexes = {}
+
+    for t in INDEX_TYPES:
+        local_map_path = os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json")
+        remote_map = download_json("faiss", f"id_map_{t}.json") or []
+        local_map = []
+        if os.path.exists(local_map_path):
+            with open(local_map_path, "r") as f:
+                local_map = json.load(f)
+        merged_map = list(set(remote_map) | set(local_map))
+        id_map_by_type[t] = merged_map
+        indexed_ids_by_type[t] = set(merged_map)
+
+        local_index_path = os.path.join(LOCAL_FAISS_DIR, f"clip_{t}.index")
+        remote_index = download_faiss_index("faiss", f"clip_{t}.index")
+        if os.path.exists(local_index_path):
+            local_index = faiss.read_index(local_index_path)
+            if remote_index:
+                remote_index.merge_from(local_index)
+            faiss_indexes[t] = remote_index
+        else:
+            # Dimension is 512 for ViT-B/32 image embeddings
+            faiss_indexes[t] = remote_index or faiss.IndexFlatIP(512)
+
+    # ---------------------------
+    # Get all images from DB
 
     # --- Get all image IDs and total count ---
     print("Fetching all image IDs from Supabase to establish processing order...")
@@ -99,191 +203,115 @@ def build_index_supabase():
         print(f"Could not retrieve all image IDs or total count: {e}. Cannot proceed without a definitive list of IDs.")
         return  # Exit if we can't get the full list of IDs
 
-    # --- Determine starting point for processing ---
-    # Force a full scan from the beginning to avoid missing newly inserted UUIDs
-    # that might sort *before* the saved checkpoints. We'll skip quickly using
-    # the id_map sets above, so we don't re-embed existing images.
-    start_index = 0
-
     total_processed_count = 0
-    resumed_total_batches = math.ceil((total_images - start_index) / BATCH_SIZE) if total_images > 0 else 0
 
-    # --- Main Loop for Pagination using ID chunks ---
-    for batch_num, i in enumerate(tqdm(range(start_index, total_images, BATCH_SIZE), desc="Processing Batches"), start=1):
-        current_id_chunk = all_image_ids[i: i + BATCH_SIZE]
-        if not current_id_chunk:
-            break  # No more IDs to process
+    # ---------------------------
+    # Main embedding loop
+    # ---------------------------
+    new_ids_by_type = {t: [] for t in INDEX_TYPES}
+    brands_added = defaultdict(int)  # For end-of-run report
 
-        # Fetch images using 'in' clause for the current chunk of IDs
-        tqdm.write(f"📦 Processing batch {batch_num}/{resumed_total_batches} (IDs: {current_id_chunk[0]} to {current_id_chunk[-1]})…")
+    for start in tqdm(range(0, len(all_image_ids), BATCH_SIZE), desc="Embedding Batches"):
+        batch_ids = all_image_ids[start:start + BATCH_SIZE]
+        # Fetch actual image data for this batch
         resp = supabase.table("product_images") \
-            .select("id, image_url") \
-            .in_("id", current_id_chunk) \
+            .select("id,image_url") \
+            .in_("id", batch_ids) \
             .execute()
+        batch = resp.data
+        skipped_count = 0
+        embedded_count = 0
+        per_type_added = {t: 0 for t in INDEX_TYPES}
 
-        batch_images = resp.data
-        if not batch_images:
-            tqdm.write(f"⚠️ No images retrieved for chunk starting with ID {current_id_chunk[0]}. Skipping this batch.")
-            continue
+        for img in batch:
+            img_id = img["id"]
+            url = img["image_url"]
 
-        tqdm.write(f"✅ Retrieved {len(batch_images)} images in this batch.")
-
-        def is_valid_image(img):
-            return img["image_url"].lower().endswith((".jpg", ".jpeg", ".png"))
-
-        # Build the list of images we actually need to embed (skip those present in all indexes)
-        current_batch_for_processing = []
-        for img in batch_images:
-            if not is_valid_image(img):
-                continue
-            # Skip if this ID already exists in *all* index maps
-            already_in_all = all(img["id"] in indexed_ids_by_type[t] for t in INDEX_TYPES)
-            if already_in_all:
-                continue
-            current_batch_for_processing.append(img)
-
-        tqdm.write(f"🆕 {len(current_batch_for_processing)} new valid images to embed in this batch.")
-        if not current_batch_for_processing:
-            continue  # Move to the next batch
-
-        color_vecs, structure_vecs, combined_vecs = [], [], []
-        id_map_for_batch = []  # Local map for this batch
-        last_id_in_current_batch = None  # Track the last processed ID (UUID) in the current batch
-
-        for img in tqdm(current_batch_for_processing, desc=f"Embedding Batch {batch_num}/{resumed_total_batches}"):
-            try:
-                r = requests.get(img["image_url"], timeout=10)
-                if not r.headers.get("Content-Type", "").startswith("image/"):
-                    tqdm.write(f"Skipping {img['image_url']}: Not an image content type.")
-                    continue
-
-                pil_color = PILImage.open(BytesIO(r.content)).convert("RGB")
-                pil_grey = pil_color.convert("L").convert("RGB")
-
-                color_tensor = preprocess(pil_color).unsqueeze(0).to(device)
-                grey_tensor = preprocess(pil_grey).unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    color_feat = model.encode_image(color_tensor)
-                    color_feat /= color_feat.norm(dim=-1, keepdim=True)
-
-                    grey_feat = model.encode_image(grey_tensor)
-                    grey_feat /= grey_feat.norm(dim=-1, keepdim=True)
-
-                    combined_feat = (color_feat + grey_feat) / 2
-                    combined_feat /= combined_feat.norm(dim=-1, keepdim=True)
-
-                color_vecs.append(color_feat.cpu().numpy().flatten())
-                structure_vecs.append(grey_feat.cpu().numpy().flatten())
-                combined_vecs.append(combined_feat.cpu().numpy().flatten())
-                id_map_for_batch.append({
-                    "id": img["id"],
-                    "image_url": img["image_url"]
-                })
-                last_id_in_current_batch = img["id"]
-
-            except (UnidentifiedImageError, Exception) as e:
-                tqdm.write(f"❌ Failed on {img['image_url']}: {e}")
+            if not is_valid_image_url(url):
+                skipped_count += 1
                 continue
 
-        os.makedirs("/tmp/faiss", exist_ok=True)
+            # Only process if missing in at least one index
+            missing_types = [t for t in INDEX_TYPES if img_id not in indexed_ids_by_type[t]]
+            if not missing_types:
+                skipped_count += 1
+                continue
 
-        def save_index_and_update_progress(name, vectors_from_current_batch, id_entries_from_current_batch, last_processed_uuid_for_batch):
-            # Load existing ID map for this specific index type
-            id_map_path = f"/tmp/faiss/id_map_{name}.json"
-            existing_id_map_data = []
-            try:
-                resp = supabase.storage.from_("faiss").download(f"id_map_{name}.json")
-                existing_id_map_data = json.loads(resp.decode('utf-8'))
-            except Exception as e:
-                tqdm.write(f"No existing {name} id map found or error loading: {e}. Creating new.")
+            pil_color = fetch_image(url)
+            if pil_color is None:
+                skipped_count += 1
+                continue
 
-            existing_ids_set = set(existing_id_map_data)
+            # Prepare tensors
+            color_tensor = preprocess(pil_color).unsqueeze(0).to(device)
 
-            # Filter vectors and IDs to only include those not already in this index's ID map
-            vectors_to_add = []
-            ids_to_add_to_map = []
-            for i, entry in enumerate(id_entries_from_current_batch):
-                entry_id_uuid = entry["id"]  # UUID string
-                if entry_id_uuid not in existing_ids_set:
-                    vectors_to_add.append(vectors_from_current_batch[i])
-                    ids_to_add_to_map.append(entry_id_uuid)
-                else:
-                    pass
+            # Structure (grayscale fed through same preprocess)
+            pil_grey = pil_color.convert("L").convert("RGB")
+            grey_tensor = preprocess(pil_grey).unsqueeze(0).to(device)
 
-            if not vectors_to_add:
-                tqdm.write(f"⚠️ No NEW vectors to save for {name} in this batch. Skipping FAISS update for this index.")
-                # Still update progress if this index type is caught up
-                if last_processed_uuid_for_batch:  # Only update if there was at least one image in this batch
-                    last_processed_ids[name] = last_processed_uuid_for_batch
-                    with open(PROGRESS_FILE_NAME, "w") as f:
-                        json.dump(last_processed_ids, f)
-                    with open(PROGRESS_FILE_NAME, "rb") as f:
-                        supabase.storage.from_("faiss").upload(
-                            file=f,
-                            path=PROGRESS_FILE_NAME,
-                            file_options={"content-type": "application/json", "x-upsert": "true"}
-                        )
-                return
+            with torch.no_grad():
+                color_feat = model.encode_image(color_tensor)
+                color_feat /= color_feat.norm(dim=-1, keepdim=True)
 
-            np_vectors_to_add = np.stack(vectors_to_add).astype(np.float32)
-            faiss.normalize_L2(np_vectors_to_add)
+                grey_feat = model.encode_image(grey_tensor)
+                grey_feat /= grey_feat.norm(dim=-1, keepdim=True)
 
-            index_path = f"/tmp/faiss/clip_{name}.index"
-            try:
-                # Attempt to download existing index to append
-                resp = supabase.storage.from_("faiss").download(f"clip_{name}.index")
-                with open(index_path, "wb") as f:
-                    f.write(resp)
-                index = faiss.read_index(index_path)
-                tqdm.write(f"Loaded existing {name} index with {index.ntotal} vectors.")
-            except Exception as e:
-                tqdm.write(f"No existing {name} index found or error loading: {e}. Creating new index.")
-                index = faiss.IndexFlatIP(np_vectors_to_add.shape[1])
+                combined_feat = (color_feat + grey_feat) / 2
+                combined_feat /= combined_feat.norm(dim=-1, keepdim=True)
 
-            index.add(np_vectors_to_add)  # Add only the truly new vectors
-            faiss.write_index(index, index_path)
+            # Convert to numpy float32
+            color_vec = color_feat.cpu().numpy().astype(np.float32)
+            grey_vec = grey_feat.cpu().numpy().astype(np.float32)
+            combined_vec = combined_feat.cpu().numpy().astype(np.float32)
 
-            # Extend the existing ID map with only the truly new IDs
-            existing_id_map_data.extend(ids_to_add_to_map)
+            # Add to relevant indexes only
+            for t in missing_types:
+                if t == "color":
+                    faiss_indexes[t].add(color_vec)
+                elif t == "structure":
+                    faiss_indexes[t].add(grey_vec)
+                else:  # combined
+                    faiss_indexes[t].add(combined_vec)
 
-            with open(id_map_path, "w") as f:
-                json.dump(existing_id_map_data, f)
+                indexed_ids_by_type[t].add(img_id)
+                new_ids_by_type[t].append(img_id)
+                per_type_added[t] += 1
+                progress[t] = img_id  # last processed id per index type
 
-            # Only upload the index and the id_map.json
-            for file_path in [index_path, id_map_path]:
-                with open(file_path, "rb") as f:
-                    file_name = os.path.basename(file_path)
-                    supabase.storage.from_("faiss").upload(
-                        file=f,
-                        path=file_name,
-                        file_options={"content-type": "application/octet-stream", "x-upsert": "true"}
-                    )
+            brand_name = extract_brand_from_url(url)
+            brands_added[brand_name] += 1
+            embedded_count += 1
 
-            # Update global last_processed_ids for this index type
-            last_processed_ids[name] = last_processed_uuid_for_batch
+        tqdm.write(
+            f"Batch {start // BATCH_SIZE + 1}: "
+            f"Total={len(batch)}, Skipped={skipped_count}, Embedded={embedded_count}, "
+            + ", ".join(f"{t}:{per_type_added[t]}" for t in INDEX_TYPES)
+        )
 
-            # Update progress.json in Supabase Storage
-            with open(PROGRESS_FILE_NAME, "w") as f:
-                json.dump(last_processed_ids, f)  # Save the current state of all indexes
+        # Save local progress & indexes after each batch
+        with open(PROGRESS_FILE, "w") as f:
+            json.dump(progress, f)
+        for t in INDEX_TYPES:
+            if new_ids_by_type[t]:
+                id_map_by_type[t].extend(new_ids_by_type[t])
+                with open(os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json"), "w") as f:
+                    json.dump(id_map_by_type[t], f)
+                faiss.write_index(faiss_indexes[t], os.path.join(LOCAL_FAISS_DIR, f"clip_{t}.index"))
+                new_ids_by_type[t] = []
 
-            with open(PROGRESS_FILE_NAME, "rb") as f:
-                supabase.storage.from_("faiss").upload(
-                    file=f,
-                    path=PROGRESS_FILE_NAME,
-                    file_options={"content-type": "application/json", "x-upsert": "true"}
-                )
+    # ---------------------------
+    # Final upload (single commit to cloud)
+    # ---------------------------
+    print("☁️ Uploading all data to Supabase...")
+    for t in INDEX_TYPES:
+        upload_json("faiss", f"id_map_{t}.json", id_map_by_type[t])
+        upload_faiss_index("faiss", f"clip_{t}.index", faiss_indexes[t])
 
-            tqdm.write(f"✅ Uploaded {name} index and updated progress with {len(vectors_to_add)} NEW vectors. Last processed ID for {name}: {last_processed_uuid_for_batch}")
+    # ---------------------------
+    # Brand coverage report
+    # ---------------------------
+    print("\n📊 Brands with new vectors this run:")
+    for brand, count in sorted(brands_added.items(), key=lambda x: x[1], reverse=True):
+        print(f"{brand}: {count} new vectors")
 
-        # Process and save for each index type
-        if color_vecs:
-            save_index_and_update_progress("color", color_vecs, id_map_for_batch, last_id_in_current_batch)
-        if structure_vecs:
-            save_index_and_update_progress("structure", structure_vecs, id_map_for_batch, last_id_in_current_batch)
-        if combined_vecs:
-            save_index_and_update_progress("combined", combined_vecs, id_map_for_batch, last_id_in_current_batch)
-
-        total_processed_count += len(current_batch_for_processing)
-
-    print(f"🎉 All FAISS indexes built cleanly and uploaded. Total images processed: {total_processed_count}")
+    print("\n🎉 All FAISS indexes built locally with bulletproof per-index resilience, resume capability, and uploaded at the end.")

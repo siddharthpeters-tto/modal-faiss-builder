@@ -1,6 +1,7 @@
 import os
 import json
 import tempfile
+import time
 from collections import defaultdict
 from urllib.parse import urlparse
 from io import BytesIO
@@ -39,7 +40,7 @@ app = App(name="build-multi-index-faiss", image=image, secrets=[Secret.from_name
 # ---------------------------
 # Config
 # ---------------------------
-BATCH_SIZE = 200
+BATCH_SIZE = 500  # increased for fewer round-trips; checkpointed each batch
 INDEX_TYPES = ["color", "structure", "combined"]
 LOCAL_FAISS_DIR = "/tmp/faiss"  # Persistent for the life of the container
 VALID_EXTENSIONS = (".jpg", ".jpeg", ".png")
@@ -75,6 +76,18 @@ def build_index_supabase():
     # ---------------------------
     # Helpers
     # ---------------------------
+    def with_retries(fn, *args, **kwargs):
+        retries = kwargs.pop("retries", 3)
+        delay = kwargs.pop("delay", 2.0)
+        last_err = None
+        for i in range(retries):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                time.sleep(delay * (2 ** i))
+        raise last_err
+
     def download_json(bucket, path):
         try:
             res = supabase.storage.from_(bucket).download(path)
@@ -135,11 +148,19 @@ def build_index_supabase():
         return "unknown"
 
     # ---------------------------
-    # Load progress.json
+    # Load progress.json (prefer local within same container, else remote)
     # ---------------------------
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, "r") as f:
-            progress = json.load(f)
+            local_progress = json.load(f)
+    else:
+        local_progress = None
+    remote_progress = download_json("faiss", "progress.json")
+
+    if local_progress is not None:
+        progress = local_progress
+    elif remote_progress is not None:
+        progress = remote_progress
     else:
         progress = {t: None for t in INDEX_TYPES}
 
@@ -204,6 +225,33 @@ def build_index_supabase():
         return  # Exit if we can't get the full list of IDs
 
     total_processed_count = 0
+
+    # ---------------------------
+    # Batch checkpoint helper (commit to Supabase after each batch)
+    # ---------------------------
+    def checkpoint_batch(id_map_by_type, new_ids_by_type, faiss_indexes, progress):
+        # 1) Write local progress and any touched index files
+        with open(PROGRESS_FILE, "w") as f:
+            json.dump(progress, f)
+
+        for t in INDEX_TYPES:
+            if new_ids_by_type[t]:
+                id_map_by_type[t].extend(new_ids_by_type[t])
+                with open(os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json"), "w") as f:
+                    json.dump(id_map_by_type[t], f)
+                faiss.write_index(faiss_indexes[t], os.path.join(LOCAL_FAISS_DIR, f"clip_{t}.index"))
+                new_ids_by_type[t] = []
+
+        # 2) Upload to Supabase with retries (atomic per-file)
+        with_retries(upload_json, "faiss", "progress.json", progress)
+        for t in INDEX_TYPES:
+            local_map_path = os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json")
+            local_index_path = os.path.join(LOCAL_FAISS_DIR, f"clip_{t}.index")
+            if os.path.exists(local_map_path) and os.path.exists(local_index_path):
+                with open(local_map_path, "r") as f:
+                    current_map = json.load(f)
+                with_retries(upload_json, "faiss", f"id_map_{t}.json", current_map)
+                with_retries(upload_faiss_index, "faiss", f"clip_{t}.index", faiss_indexes[t])
 
     # ---------------------------
     # Main embedding loop
@@ -288,24 +336,17 @@ def build_index_supabase():
             + ", ".join(f"{t}:{per_type_added[t]}" for t in INDEX_TYPES)
         )
 
-        # Save local progress & indexes after each batch
-        with open(PROGRESS_FILE, "w") as f:
-            json.dump(progress, f)
-        for t in INDEX_TYPES:
-            if new_ids_by_type[t]:
-                id_map_by_type[t].extend(new_ids_by_type[t])
-                with open(os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json"), "w") as f:
-                    json.dump(id_map_by_type[t], f)
-                faiss.write_index(faiss_indexes[t], os.path.join(LOCAL_FAISS_DIR, f"clip_{t}.index"))
-                new_ids_by_type[t] = []
+        # ✅ Robust checkpoint: save + upload after each batch
+        checkpoint_batch(id_map_by_type, new_ids_by_type, faiss_indexes, progress)
 
     # ---------------------------
-    # Final upload (single commit to cloud)
+    # Final upload (kept as safety; most work already committed per batch)
     # ---------------------------
-    print("☁️ Uploading all data to Supabase...")
+    print("☁️ Finalizing (safety upload) to Supabase...")
     for t in INDEX_TYPES:
-        upload_json("faiss", f"id_map_{t}.json", id_map_by_type[t])
-        upload_faiss_index("faiss", f"clip_{t}.index", faiss_indexes[t])
+        with_retries(upload_json, "faiss", f"id_map_{t}.json", id_map_by_type[t])
+        with_retries(upload_faiss_index, "faiss", f"clip_{t}.index", faiss_indexes[t])
+    with_retries(upload_json, "faiss", "progress.json", progress)
 
     # ---------------------------
     # Brand coverage report
@@ -314,4 +355,4 @@ def build_index_supabase():
     for brand, count in sorted(brands_added.items(), key=lambda x: x[1], reverse=True):
         print(f"{brand}: {count} new vectors")
 
-    print("\n🎉 All FAISS indexes built locally with bulletproof per-index resilience, resume capability, and uploaded at the end.")
+    print("\n🎉 All FAISS indexes built with per-batch remote checkpoints and full resume capability.")
