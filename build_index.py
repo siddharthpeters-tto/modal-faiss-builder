@@ -6,7 +6,8 @@ from collections import defaultdict
 from urllib.parse import urlparse
 from io import BytesIO
 
-from modal import App, Image, Secret, Mount
+from modal import App, Image, Secret
+from modal.mount import Mount
 
 import requests
 import faiss
