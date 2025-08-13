@@ -60,7 +60,7 @@ PROGRESS_FILE = os.path.join(LOCAL_FAISS_DIR, "progress.json")
 @app.function(
     image=image,
     timeout=3600,
-    gpu="A10G"
+    gpu="A10G",
     mounts=[Mount.from_local_file("faiss_sharding.py", remote_path="/root/faiss_sharding.py")]
 )
 def build_index_supabase():
