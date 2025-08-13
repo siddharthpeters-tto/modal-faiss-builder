@@ -6,7 +6,8 @@ from collections import defaultdict
 from urllib.parse import urlparse
 from io import BytesIO
 
-from modal import App, Image, Secret
+from modal import App, Image, Secret, Mount
+
 import requests
 import faiss
 import numpy as np
@@ -60,6 +61,7 @@ PROGRESS_FILE = os.path.join(LOCAL_FAISS_DIR, "progress.json")
     image=image,
     timeout=3600,
     gpu="A10G"
+    mounts=[Mount.from_local_dir(".", remote_path="/root")]
 )
 def build_index_supabase():
     import torch
