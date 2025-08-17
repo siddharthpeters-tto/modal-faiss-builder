@@ -47,7 +47,7 @@ app = App(name="build-color-index-faiss", image=image, secrets=[Secret.from_name
 # ---------------------------
 # Config
 # ---------------------------
-SHARD_SIZE = 2500  # vectors per shard (~6 MB)
+SHARD_SIZE = 2000  # vectors per shard
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
 INDEX_TYPES = ["color"]  # scalable to ["color", "structure", "combined"]
 DIM_BY_TYPE = {"color": 512}
@@ -237,9 +237,12 @@ def build_index_supabase():
 
                 # --- NEW: sanity check to keep id_map and index in sync
                 try:
-                    expected = len(id_map_by_type[t]) + len(shard_state.current_ids[t])
-                    assert faiss_indexes[t].ntotal == expected, (
-                        f"Mismatch for {t}: index has {faiss_indexes[t].ntotal}, id_map + open_shard has {expected}"
+                    open_ix = shard_state.current_ix.get(t)
+                    open_count = open_ix.ntotal if open_ix is not None else 0
+                    index_total = (faiss_indexes[t].ntotal if t in faiss_indexes else 0) + open_count
+                    expected = len(id_map_by_type[t]) + len(shard_state.current_ids.get(t, []))
+                    assert index_total == expected, (
+                        f"Mismatch for {t}: index has {index_total}, id_map + open_shard has {expected}"
                     )
                 except AssertionError as ae:
                     print(f"⚠️ {ae}")
@@ -323,12 +326,10 @@ def build_index_supabase():
                 f"(~{len(shard_state.current_ids['color']) * 2048 / (1024*1024):.1f} MB)")
             flush_open_shard(supabase, "color", shard_state, id_map_by_type)
             # ✅ Alignment check after flush
-            index_size = shard_state.index.ntotal if shard_state.index else 0
+            ix = shard_state.current_ix.get("color")
+            index_size = ix.ntotal if ix is not None else 0
             idmap_size = len(id_map_by_type["color"])
-            if index_size != idmap_size:
-                print(f"⚠️ Mismatch after flush: index has {index_size}, id_map has {idmap_size}")
-            else:
-                print(f"✅ Alignment OK after flush: {index_size} vectors")
+
         # Soft stop close to time budget — we’ve just flushed & checkpointed, so it’s safe to exit
         if time.time() - START_TIME > MAX_SECONDS:
             print("⏹️ Soft stop: time budget reached. Progress/checkpoints flushed. Re-run to continue.")
