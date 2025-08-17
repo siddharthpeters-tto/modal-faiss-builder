@@ -82,6 +82,8 @@ def build_index_supabase():
 
     os.makedirs(LOCAL_FAISS_DIR, exist_ok=True)
 
+    
+
     # ---------- resiliency helpers (from old) ----------
     def with_retries(fn, *args, **kwargs):
         retries = kwargs.pop("retries", 5)
@@ -183,14 +185,30 @@ def build_index_supabase():
     # ---------- fetch candidate images (append-only + progress gate) ----------
     print("Fetching image IDs and URLs from Supabase…")
     try:
-        query = supabase.table("product_images").select("id,image_url").order("id")
-        #if MAX_IMAGES:
-        #    query = query.limit(MAX_IMAGES)
-        ids_resp = query.execute()
-        rows = ids_resp.data or []
+        def fetch_all_product_images(page_size=1000):
+            all_rows = []
+            offset = 0
+            while True:
+                resp = (
+                    supabase.table("product_images")
+                    .select("id,image_url")
+                    .order("id")
+                    .range(offset, offset + page_size - 1)
+                    .execute()
+                )
+                batch = resp.data or []
+                if not batch:
+                    break
+                all_rows.extend(batch)
+                offset += page_size
+                print(f"Fetched {len(batch)} rows, total so far {len(all_rows)}…")
+            return all_rows
+
+        rows = fetch_all_product_images()
     except Exception as e:
         print(f"Error fetching IDs: {e}")
         return
+
 
     # Filter: not yet indexed + beyond last progress
     last_done = progress.get("color")
