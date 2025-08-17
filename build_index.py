@@ -314,8 +314,6 @@ def build_index_supabase():
             print(f"🗂️ Flushing shard with {len(shard_state.current_ids['color'])} vectors "
                 f"(~{len(shard_state.current_ids['color']) * 2048 / (1024*1024):.1f} MB)")
             flush_open_shard(supabase, "color", shard_state, id_map_by_type)
-            # ✅ Always sync id_map after shard flush
-            with_retries(upload_json, "faiss", "id_map_color.json", id_map_by_type["color"])
 
             # ✅ Alignment check only after flush
             open_ix = shard_state.current_ix.get("color")
@@ -341,7 +339,6 @@ def build_index_supabase():
                 print(f"☁️ Flushing final shard with {remaining} vectors (~{remaining * 2048 / (1024*1024):.1f} MB)")
                 flush_open_shard(supabase, "color", shard_state, id_map_by_type)
                 # ✅ Always sync id_map after shard flush
-    with_retries(upload_json, "faiss", f"id_map_color.json", id_map_by_type["color"])
     with_retries(upload_json, "faiss", "progress.json", progress)
 
     print("\n📊 Brands processed:")

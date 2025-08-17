@@ -184,6 +184,7 @@ def flush_open_shard(
     ix = shard_state.current_ix[embed_type]
     if ix.ntotal == 0:
         return
+
     shard_id = shard_state.next_shard_id[embed_type]
     approx_mb = _upload_shard(supabase, embed_type, shard_id, ix)
     _append_manifest_entry(supabase, embed_type, shard_id, ix, approx_mb)
@@ -197,11 +198,21 @@ def flush_open_shard(
     shard_name = f"clip_{embed_type}_shard_{shard_id:05d}.index"
     shard_state.shards[embed_type].append(shard_name)
 
-    # prepare next
+    # ✅ upload id_map JSON right here (atomic with shard flush)
+    idmap_filename = f"id_map_{embed_type}.json"
+    supabase.storage.from_(BUCKET).upload(
+        path=_join_key(idmap_filename),
+        file=json.dumps(id_map_by_type[embed_type]).encode("utf-8"),
+        file_options={"contentType": "application/json", "upsert": "true"},
+    )
+
+    print(f"✅ Flushed shard {shard_id:05d} with {ix.ntotal} vectors")
+    print(f"✅ Synced {idmap_filename} with {len(id_map_by_type[embed_type])} entries")
+
+    # prepare next shard
     d = shard_state.dim_by_type[embed_type]
     shard_state.current_ix[embed_type] = faiss.IndexFlatIP(d)
     shard_state.next_shard_id[embed_type] = shard_id + 1
-
 
 
 # -----------------------------
