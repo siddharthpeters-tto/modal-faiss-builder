@@ -1,86 +1,128 @@
-# FAISS Index Sharding on Modal with Supabase Storage
+# FAISS Sharded Index Builder & Validator
 
-This project embeds product images, stores results in **FAISS indexes**, and uploads them to **Supabase Storage** in shards to avoid file size limits. It is designed for **resilience**, allowing runs to resume from progress if interrupted.
+This repo contains scripts to **embed product images, build a sharded FAISS index via Modal**, and **validate index alignment locally** against Supabase.
 
-## Key Features
+---
 
-- **Three index types** supported in architecture: `color`, `structure`, and `combined` (current runs may use `color` only).
-- **Sharding**: Each index is split into shards (~1,000 images each) to keep files below Supabase’s ~50 MB per-file limit.
-- **Immediate uploads**: Shards are uploaded to Supabase after each batch — no reliance on large local or ephemeral storage.
-- **Resumable runs**: Progress is tracked in `progress.json` stored in Supabase, enabling restarts without reprocessing.
-- **Batch processing**: Embedding runs in configurable batches for efficiency.
-- **Error handling**: Skips failed images but records completed ones.
-- **Merged local + remote state**: Index and ID map merging from both local disk and Supabase ensures no progress loss.
-- **GPU acceleration**: Runs on GPU (`A10G`) in Modal for faster embedding.
-- **Brand tracking**: Tracks number of vectors added per brand for monitoring.
-- **Safety checks**: Asserts ID map and FAISS vector counts match after each checkpoint.
-- **Safer normalization**: Uses `clamp(min=1e-12)` to avoid divide-by-zero issues.
-- **Alignment verification**: `check_alignment.py` script verifies that index vectors and ID map are perfectly aligned, detects duplicates, and runs random match checks.
+## Components
 
-## Structure
+* **`build_index.py`**
+  Modal app that:
 
-- `build_400.py` – Production-grade build script with merged enhancements (multi-index capable, resumable, robust sharding, and safety checks).
-- `faiss_sharding.py` – Manages shard creation, rotation, uploads, manifest management, and loading sharded indexes.
-- `check_alignment.py` – Verifies alignment between FAISS index and ID map, detects duplicates, and validates match accuracy.
-- `.env.example` – Environment variable template.
+  * Fetches product image metadata from Supabase.
+  * Encodes images with CLIP embeddings.
+  * Builds a **sharded FAISS index** (CPU-based).
+  * Uploads `.index` shards and `id_map.json` to Supabase storage.
 
-## Requirements
+* **`faiss_sharding.py`**
+  Utilities for managing shard offsets and index splitting.
 
-- **Modal** account & CLI (`pip install modal`)
-- **Supabase** project with `product_images` table and storage bucket for FAISS files
-- Dependencies: `faiss-cpu`, `torch`, `tqdm`, `supabase-py`, `numpy`, `Pillow`, `clip-by-openai`, etc.
+* **`check_alignment.py`**
+  Local verification tool to:
 
-## Setup
+  * Confirm index ↔ id\_map consistency.
+  * Sample random images, encode them, and search the index.
+  * Validate that IDs resolve to the expected shard and position.
 
-1. Create a Modal secret:
+---
+
+## Workflow
+
+### 1. Build Embeddings & Shards on Modal
+
 ```bash
-modal secret create supabase-creds \
-  SUPABASE_URL="YOUR_SUPABASE_URL" \
-  SUPABASE_KEY="YOUR_SUPABASE_ANON_KEY"
+modal run build_index.py
 ```
-2. Clone and configure:
+
+This will:
+
+* Encode product images via CLIP.
+* Save shard files (`clip_color_shard_00000.index`, …) and `id_map_color.json` to Supabase storage.
+
+---
+
+### 2. Validate Alignment Locally
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/modal-faiss-builder.git
-cd modal-faiss-builder
+python check_alignment.py
 ```
 
-## Running
+Checks include:
 
-Deploy:
-```bash
-modal deploy build_400.py
+* **Sanity check:** every index position maps to the correct ID.
+* **Random search test:** encodes sample images and verifies they return correctly.
+* **Shard verification:** confirms mapping between global IDs and shard offsets.
+
+---
+
+## Notes
+
+* Cosine similarity normalization is applied so values are consistent regardless of FAISS metric type (L2 or IP).
+* Duplicate detection logic has been removed for clarity.
+* Make sure environment variables (`SUPABASE_URL`, `SUPABASE_KEY`, `BUCKET_NAME`, `PREFIX`) are set in `.env`.
+
+---
+
+## Example Outputs
+
+### From `build_index.py` (Modal)
+
 ```
-Run with environment-configured limits (e.g., MAX_IMAGES=400 in `.env`):
-```bash
-modal run build_index.py::build_index_supabase
+Batch 1: Total=500, Embedded=500
+Batch 2: Total=500, Embedded=500
+📊 Brands processed:
+aw: 137 new vectors
+unknown: 863 new vectors
 ```
 
-Process:
-1. Load unprocessed IDs from Supabase, filtering out already indexed ones and IDs before last checkpoint.
-2. Embed in batches.
-3. Append vectors to the current shard per index type.
-4. Rotate & upload shard if it reaches the size threshold.
-5. Flush shards at batch end.
-6. Save `progress.json` and updated ID maps to Supabase (and locally).
-7. Verify FAISS vector count matches ID map count after each checkpoint.
+### From `check_alignment.py`
 
-## Recovery
-
-If interrupted, the script resumes from `progress.json`, skipping already processed IDs.
-
-## Alignment Check
-
-Run `check_alignment.py` to validate that all vectors in the FAISS index correspond exactly to the correct IDs in the ID map, with no duplicates or mismatches.
-
-## Supabase Storage Layout
 ```
-supabase-storage/
-  faiss/
-    clip_color_shard_00001.index
-    clip_structure_shard_00001.index
-    clip_combined_shard_00001.index
-    id_map_color.json
-    id_map_structure.json
-    id_map_combined.json
-    progress.json
+[42/200] ✅ id=abc123 | pos(id_map)=102 → shard#2 | top1_pos=102 → shard#2 | rank=1 | cos=0.9987
+⚠️ Mismatch for color: index has 1000, id_map has 2000
 ```
+
+---
+
+## Quickstart
+
+1. **Clone repo & install deps**
+
+   ```bash
+   git clone https://github.com/<your-repo>.git
+   cd <your-repo>
+   pip install -r requirements.txt
+   ```
+
+2. **Setup `.env`** with your Supabase credentials and FAISS config:
+
+   ```
+   SUPABASE_URL=...
+   SUPABASE_KEY=...
+   BUCKET_NAME=faiss
+   PREFIX=clip_color
+   ```
+
+3. **Run Modal build**
+
+   ```bash
+   modal run build_index.py
+   ```
+
+4. **Validate locally**
+
+   ```bash
+   python check_alignment.py
+   ```
+
+---
+
+## Repo Structure
+
+```
+build_index.py       # Modal app for embedding + FAISS sharding
+faiss_sharding.py    # Shard helpers
+check_alignment.py   # Local validator
+readme.md            # This file
+```
+
