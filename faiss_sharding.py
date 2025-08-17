@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import os
 import json
 import time
 from typing import Dict, List, Optional
@@ -14,7 +14,7 @@ BUCKET = "faiss"
 # Optional folder prefix inside the bucket (e.g., "indexes"). Leave "" for bucket root.
 OBJECT_DIR = ""
 # Target shard size. Keep safely below hosted Supabase's per-object cap (~50 MB on Free/Pro).
-TARGET_SHARD_MB = 30.0
+TARGET_SHARD_MB = float(os.getenv("TARGET_SHARD_MB", "30"))
 # Manifest schema version (bump if you change structure)
 MANIFEST_VERSION = 1
 
@@ -57,17 +57,26 @@ class ShardState:
     dim_by_type: mapping like {"color": 512, "structure": 512, ...}
     """
 
-    def __init__(self, dim_by_type: Dict[str, int]):
-        self.dim_by_type = dict(dim_by_type)
-        self.current_ix: Dict[str, faiss.Index] = {}
-        self.next_shard_id: Dict[str, int] = {}
+    def __init__(self, dim_by_type):
+        self.current_vectors = {t: [] for t in dim_by_type}
+        self.current_ids = {t: [] for t in dim_by_type}
+        self.shard_counts = {t: 0 for t in dim_by_type}
+        self.current_shard_index = {t: 0 for t in dim_by_type}
+        self.dim_by_type = dim_by_type
+        
+        # 🔥 Add this line:
+        self.shards = {t: [] for t in dim_by_type}
+        self.current_ix = {}
+        self.next_shard_id = {}
 
     def ensure_open(self, embed_type: str) -> None:
         if embed_type not in self.current_ix:
             d = self.dim_by_type[embed_type]
-            self.current_ix[embed_type] = faiss.IndexFlatL2(d)
+            self.current_ix[embed_type] = faiss.IndexFlatIP(d)  # ✅ IP for cosine
         if embed_type not in self.next_shard_id:
             self.next_shard_id[embed_type] = 0
+        if embed_type not in self.current_ids:
+            self.current_ids[embed_type] = []  # ✅ init
 
 
 # -----------------------------
@@ -127,13 +136,18 @@ def _append_manifest_entry(supabase, embed_type: str, shard_id: int, ix: faiss.I
     save_manifest(supabase, manifest)
 
 
+## Patch to track shard names inside ShardState
+
+# In faiss_sharding.py, update your flush functions like this:
+
+
 def maybe_rotate_and_upload_shard(
     supabase,
     embed_type: str,
     shard_state: ShardState,
+    id_map_by_type: dict,
     target_mb: float = TARGET_SHARD_MB,
 ) -> None:
-    """If the current shard exceeds target_mb, upload it and start a new one."""
     shard_state.ensure_open(embed_type)
     ix = shard_state.current_ix[embed_type]
     if ix.ntotal == 0:
@@ -144,14 +158,28 @@ def maybe_rotate_and_upload_shard(
     shard_id = shard_state.next_shard_id[embed_type]
     approx_mb = _upload_shard(supabase, embed_type, shard_id, ix)
     _append_manifest_entry(supabase, embed_type, shard_id, ix, approx_mb)
+
+    # ✅ keep id_map in the same order as shard flush
+    if embed_type in shard_state.current_ids:
+        id_map_by_type[embed_type].extend(shard_state.current_ids[embed_type])
+        shard_state.current_ids[embed_type] = []
+
+    # ✅ record shard name
+    shard_name = f"clip_{embed_type}_shard_{shard_id:05d}.index"
+    shard_state.shards[embed_type].append(shard_name)
+
     # rotate to fresh empty shard
     d = shard_state.dim_by_type[embed_type]
-    shard_state.current_ix[embed_type] = faiss.IndexFlatL2(d)
+    shard_state.current_ix[embed_type] = faiss.IndexFlatIP(d)
     shard_state.next_shard_id[embed_type] = shard_id + 1
 
 
-def flush_open_shard(supabase, embed_type: str, shard_state: ShardState) -> None:
-    """Upload the current open shard even if below target size. Call at end of build."""
+def flush_open_shard(
+    supabase,
+    embed_type: str,
+    shard_state: ShardState,
+    id_map_by_type: dict,
+) -> None:
     shard_state.ensure_open(embed_type)
     ix = shard_state.current_ix[embed_type]
     if ix.ntotal == 0:
@@ -159,10 +187,21 @@ def flush_open_shard(supabase, embed_type: str, shard_state: ShardState) -> None
     shard_id = shard_state.next_shard_id[embed_type]
     approx_mb = _upload_shard(supabase, embed_type, shard_id, ix)
     _append_manifest_entry(supabase, embed_type, shard_id, ix, approx_mb)
-    # prepare next id for any future appends
+
+    # ✅ sync id_map with this shard
+    if embed_type in shard_state.current_ids:
+        id_map_by_type[embed_type].extend(shard_state.current_ids[embed_type])
+        shard_state.current_ids[embed_type] = []
+
+    # ✅ record shard name
+    shard_name = f"clip_{embed_type}_shard_{shard_id:05d}.index"
+    shard_state.shards[embed_type].append(shard_name)
+
+    # prepare next
     d = shard_state.dim_by_type[embed_type]
-    shard_state.current_ix[embed_type] = faiss.IndexFlatL2(d)
+    shard_state.current_ix[embed_type] = faiss.IndexFlatIP(d)
     shard_state.next_shard_id[embed_type] = shard_id + 1
+
 
 
 # -----------------------------
