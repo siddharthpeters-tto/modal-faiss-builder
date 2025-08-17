@@ -70,7 +70,7 @@ def build_index_supabase():
 
     load_dotenv()
 
-    MAX_IMAGES = int(os.getenv("MAX_IMAGES", "0"))  # 0 = no limit
+    #MAX_IMAGES = int(os.getenv("MAX_IMAGES", "0"))  # 0 = no limit
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -184,8 +184,8 @@ def build_index_supabase():
     print("Fetching image IDs and URLs from Supabase…")
     try:
         query = supabase.table("product_images").select("id,image_url").order("id")
-        if MAX_IMAGES:
-            query = query.limit(MAX_IMAGES)
+        #if MAX_IMAGES:
+        #    query = query.limit(MAX_IMAGES)
         ids_resp = query.execute()
         rows = ids_resp.data or []
     except Exception as e:
