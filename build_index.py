@@ -228,30 +228,19 @@ def build_index_supabase():
     new_ids_by_type = {t: [] for t in INDEX_TYPES}
 
     def checkpoint_batch():
-        # extend id_map with any new ids (per type), write both id_map and faiss index locally
+        # Write id_map and FAISS index locally if new ids were added
         for t in INDEX_TYPES:
             if new_ids_by_type[t]:
                 with open(os.path.join(LOCAL_FAISS_DIR, f"id_map_{t}.json"), "w") as f:
                     json.dump(id_map_by_type[t], f)
                 faiss.write_index(faiss_indexes[t], os.path.join(LOCAL_FAISS_DIR, f"clip_{t}.index"))
-
-                # --- NEW: sanity check to keep id_map and index in sync
-                try:
-                    open_ix = shard_state.current_ix.get(t)
-                    open_count = open_ix.ntotal if open_ix is not None else 0
-                    index_total = (faiss_indexes[t].ntotal if t in faiss_indexes else 0) + open_count
-                    expected = len(id_map_by_type[t])   # ✅ id_map already has all IDs
-                    assert index_total == expected, (
-                        f"Mismatch for {t}: index has {index_total}, id_map + open_shard has {expected}"
-                    )
-                except AssertionError as ae:
-                    print(f"⚠️ {ae}")
                 new_ids_by_type[t] = []
 
+        # Save progress
         with open(PROGRESS_FILE, "w") as f:
             json.dump(progress, f)
 
-        # upload artifacts (with retries) to cloud
+        # Upload progress + id_map to Supabase
         with_retries(upload_json, "faiss", "progress.json", progress)
         for t in INDEX_TYPES:
             with_retries(upload_json, "faiss", f"id_map_{t}.json", id_map_by_type[t])
@@ -325,10 +314,17 @@ def build_index_supabase():
             print(f"🗂️ Flushing shard with {len(shard_state.current_ids['color'])} vectors "
                 f"(~{len(shard_state.current_ids['color']) * 2048 / (1024*1024):.1f} MB)")
             flush_open_shard(supabase, "color", shard_state, id_map_by_type)
-            # ✅ Alignment check after flush
-            ix = shard_state.current_ix.get("color")
-            index_size = ix.ntotal if ix is not None else 0
-            idmap_size = len(id_map_by_type["color"])
+
+            # ✅ Alignment check only after flush
+            open_ix = shard_state.current_ix.get("color")
+            open_count = open_ix.ntotal if open_ix is not None else 0
+            index_total = (faiss_indexes["color"].ntotal if "color" in faiss_indexes else 0) + open_count
+            expected = len(id_map_by_type["color"])
+            if index_total != expected:
+                print(f"⚠️ Mismatch after flush: index({index_total}) vs id_map({expected})")
+            else:
+                print(f"✅ Flush aligned: {expected} vectors")
+
 
         # Soft stop close to time budget — we’ve just flushed & checkpointed, so it’s safe to exit
         if time.time() - START_TIME > MAX_SECONDS:
