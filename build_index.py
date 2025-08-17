@@ -47,6 +47,7 @@ app = App(name="build-color-index-faiss", image=image, secrets=[Secret.from_name
 # ---------------------------
 # Config
 # ---------------------------
+SHARD_SIZE = 5000  # vectors per shard (~30 MB)
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
 INDEX_TYPES = ["color"]  # scalable to ["color", "structure", "combined"]
 DIM_BY_TYPE = {"color": 512}
@@ -70,7 +71,6 @@ def build_index_supabase():
 
     load_dotenv()
 
-    #MAX_IMAGES = int(os.getenv("MAX_IMAGES", "0"))  # 0 = no limit
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -288,8 +288,8 @@ def build_index_supabase():
 
             # 🔍 Sanity check: print norm of the vector (should be ~1.0)
             norm = np.linalg.norm(vec)
-            if start == 0 and embedded_count < 3:  # only print a couple per first batch to avoid spam
-                print(f"Sanity check norm for image {img_id}: {norm:.4f}")
+            if start == 0 and embedded_count < 1:  # only print a couple per first batch to avoid spam
+                print(f"Sanity check on normalization {img_id}: {norm:.4f}")
 
             # add to global in-memory index + open shard
             faiss_indexes["color"].add(vec)
@@ -315,8 +315,13 @@ def build_index_supabase():
             f"Embedded={embedded_count}, color:{per_type_added['color']}"
         )
 
-        flush_open_shard(supabase, "color", shard_state, id_map_by_type)  # ✅ add id_map_by_type
         checkpoint_batch()
+        
+        # But only flush the shard if it's full
+        if len(shard_state.current_ids["color"]) >= SHARD_SIZE:
+            print(f"🗂️ Flushing shard with {len(shard_state.current_ids['color'])} vectors "
+                f"(~{len(shard_state.current_ids['color']) * 2048 / (1024*1024):.1f} MB)")
+            flush_open_shard(supabase, "color", shard_state, id_map_by_type)
         # Soft stop close to time budget — we’ve just flushed & checkpointed, so it’s safe to exit
         if time.time() - START_TIME > MAX_SECONDS:
             print("⏹️ Soft stop: time budget reached. Progress/checkpoints flushed. Re-run to continue.")
