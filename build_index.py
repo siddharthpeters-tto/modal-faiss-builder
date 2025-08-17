@@ -47,7 +47,7 @@ app = App(name="build-color-index-faiss", image=image, secrets=[Secret.from_name
 # ---------------------------
 # Config
 # ---------------------------
-SHARD_SIZE = 3000  # vectors per shard (~6 MB)
+SHARD_SIZE = 2500  # vectors per shard (~6 MB)
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
 INDEX_TYPES = ["color"]  # scalable to ["color", "structure", "combined"]
 DIM_BY_TYPE = {"color": 512}
@@ -292,7 +292,7 @@ def build_index_supabase():
                 print(f"Sanity check on normalization {img_id}: {norm:.4f}")
 
             # add to global in-memory index + open shard
-            faiss_indexes["color"].add(vec)
+            #faiss_indexes["color"].add(vec) #Screwing me up when I'm going for my next round!
             shard_state.ensure_open("color")
             shard_state.current_ix["color"].add(vec)
 
