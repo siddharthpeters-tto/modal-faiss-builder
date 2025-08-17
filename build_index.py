@@ -322,6 +322,13 @@ def build_index_supabase():
             print(f"🗂️ Flushing shard with {len(shard_state.current_ids['color'])} vectors "
                 f"(~{len(shard_state.current_ids['color']) * 2048 / (1024*1024):.1f} MB)")
             flush_open_shard(supabase, "color", shard_state, id_map_by_type)
+            # ✅ Alignment check after flush
+            index_size = shard_state.index.ntotal if shard_state.index else 0
+            idmap_size = len(id_map_by_type["color"])
+            if index_size != idmap_size:
+                print(f"⚠️ Mismatch after flush: index has {index_size}, id_map has {idmap_size}")
+            else:
+                print(f"✅ Alignment OK after flush: {index_size} vectors")
         # Soft stop close to time budget — we’ve just flushed & checkpointed, so it’s safe to exit
         if time.time() - START_TIME > MAX_SECONDS:
             print("⏹️ Soft stop: time budget reached. Progress/checkpoints flushed. Re-run to continue.")
