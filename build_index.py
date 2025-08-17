@@ -47,7 +47,7 @@ app = App(name="build-color-index-faiss", image=image, secrets=[Secret.from_name
 # ---------------------------
 # Config
 # ---------------------------
-SHARD_SIZE = 5000  # vectors per shard (~30 MB)
+SHARD_SIZE = 3000  # vectors per shard (~6 MB)
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
 INDEX_TYPES = ["color"]  # scalable to ["color", "structure", "combined"]
 DIM_BY_TYPE = {"color": 512}
@@ -327,8 +327,13 @@ def build_index_supabase():
             print("⏹️ Soft stop: time budget reached. Progress/checkpoints flushed. Re-run to continue.")
             return
 
-    print("☁️ Flushing shards…")
-    flush_open_shard(supabase, "color", shard_state, id_map_by_type)  # ✅ add id_map_by_type
+        remaining = len(shard_state.current_ids["color"])
+        if remaining > 0:
+            if remaining < SHARD_SIZE:
+                print(f"⏸️ Keeping last shard open with {remaining} vectors (not flushing yet).")
+            else:
+                print(f"☁️ Flushing final shard with {remaining} vectors (~{remaining * 2048 / (1024*1024):.1f} MB)")
+                flush_open_shard(supabase, "color", shard_state, id_map_by_type)
     with_retries(upload_json, "faiss", f"id_map_color.json", id_map_by_type["color"])
     with_retries(upload_json, "faiss", "progress.json", progress)
 
