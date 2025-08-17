@@ -47,8 +47,8 @@ app = App(name="build-color-index-faiss", image=image, secrets=[Secret.from_name
 # ---------------------------
 # Config
 # ---------------------------
-SHARD_SIZE = 2000  # vectors per shard
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
+SHARD_SIZE = 1000  # vectors per shard
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
 INDEX_TYPES = ["color"]  # scalable to ["color", "structure", "combined"]
 DIM_BY_TYPE = {"color": 512}
 LOCAL_FAISS_DIR = "/tmp/faiss"
@@ -240,7 +240,7 @@ def build_index_supabase():
                     open_ix = shard_state.current_ix.get(t)
                     open_count = open_ix.ntotal if open_ix is not None else 0
                     index_total = (faiss_indexes[t].ntotal if t in faiss_indexes else 0) + open_count
-                    expected = len(id_map_by_type[t]) + len(shard_state.current_ids.get(t, []))
+                    expected = len(id_map_by_type[t])   # ✅ id_map already has all IDs
                     assert index_total == expected, (
                         f"Mismatch for {t}: index has {index_total}, id_map + open_shard has {expected}"
                     )
