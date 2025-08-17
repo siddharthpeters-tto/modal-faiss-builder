@@ -80,6 +80,9 @@ def build_index_supabase():
     model.eval()
     print(f"✅ Using device: {device}")
 
+    START_TIME = time.time()
+    MAX_SECONDS = int(os.getenv("MAX_SECONDS", "3300"))  # ~55 min soft limit
+
     os.makedirs(LOCAL_FAISS_DIR, exist_ok=True)
 
     
@@ -211,10 +214,13 @@ def build_index_supabase():
 
 
     # Filter: not yet indexed + beyond last progress
-    last_done = progress.get("color")
+    #last_done = progress.get("color")
+    #ids_to_process = [r for r in rows if r["id"] not in indexed_ids_by_type["color"]]
+    #if last_done:
+    #    ids_to_process = [r for r in ids_to_process if r["id"] > last_done]
+    # Resume purely via id_map; UUID ordering isn’t monotonic
     ids_to_process = [r for r in rows if r["id"] not in indexed_ids_by_type["color"]]
-    if last_done:
-        ids_to_process = [r for r in ids_to_process if r["id"] > last_done]
+
 
     print(f"Processing {len(ids_to_process)} new images…")
 
@@ -231,8 +237,9 @@ def build_index_supabase():
 
                 # --- NEW: sanity check to keep id_map and index in sync
                 try:
-                    assert faiss_indexes[t].ntotal == len(id_map_by_type[t]), (
-                        f"Mismatch for {t}: index has {faiss_indexes[t].ntotal}, id_map has {len(id_map_by_type[t])}"
+                    expected = len(id_map_by_type[t]) + len(shard_state.current_ids[t])
+                    assert faiss_indexes[t].ntotal == expected, (
+                        f"Mismatch for {t}: index has {faiss_indexes[t].ntotal}, id_map + open_shard has {expected}"
                     )
                 except AssertionError as ae:
                     print(f"⚠️ {ae}")
@@ -310,6 +317,10 @@ def build_index_supabase():
 
         flush_open_shard(supabase, "color", shard_state, id_map_by_type)  # ✅ add id_map_by_type
         checkpoint_batch()
+        # Soft stop close to time budget — we’ve just flushed & checkpointed, so it’s safe to exit
+        if time.time() - START_TIME > MAX_SECONDS:
+            print("⏹️ Soft stop: time budget reached. Progress/checkpoints flushed. Re-run to continue.")
+            return
 
     print("☁️ Flushing shards…")
     flush_open_shard(supabase, "color", shard_state, id_map_by_type)  # ✅ add id_map_by_type
